@@ -11,9 +11,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use flamed_rpc::{
-    async_trait, codes, BlockId, BlockTxEnvelope, ContractEnvelope, ContractId, ContractResult,
-    ErrorCode, ErrorObjectOwned, FlamedApiServer, PredicatePoint, ProofBytes, ProofResult,
-    RpcResult, ScanResult, TipResult, TxId, TxStatusResult, MAX_PROOF_IDS, MAX_SCAN_PREDICATES,
+    async_trait, codes, ActorId, ActorResult, BlockId, BlockTxEnvelope, ContractEnvelope,
+    ContractId, ContractResult, ErrorCode, ErrorObjectOwned, FlamedApiServer, PredicatePoint,
+    ProofBytes, ProofResult, RpcResult, ScanResult, TipResult, TxId, TxStatusResult, MAX_PROOF_IDS,
+    MAX_SCAN_PREDICATES,
+};
+use flamed_rpc::{
+    ActorDetailResult, BlockResult, BlocksResult, ContractDetailResult, NetworkResult,
+    TransactionResult, TransactionsResult,
 };
 use jsonrpsee::server::{BatchRequestConfig, Server, ServerConfig, ServerHandle};
 
@@ -25,8 +30,7 @@ use crate::node::{Node, NodeError, ProofStatus, SharedNode, TxStatus};
 /// not for a thousand.
 const MAX_REQUEST_BYTES: u32 = 1024 * 1024;
 
-/// The largest reply it will send. A `scan` over a busy predicate is the
-/// only thing that approaches it.
+/// The largest reply it will send, including scans and actor state envelopes.
 const MAX_RESPONSE_BYTES: u32 = 64 * 1024 * 1024;
 
 /// The most calls one batch may carry.
@@ -75,6 +79,79 @@ impl FlamedRpc {
 
 #[async_trait]
 impl FlamedApiServer for FlamedRpc {
+    async fn network(&self) -> RpcResult<NetworkResult> {
+        self.with_node(|node| Ok(node.network())).await
+    }
+
+    async fn blocks(&self, before: Option<u64>, limit: u32) -> RpcResult<BlocksResult> {
+        self.with_node(move |node| node.blocks(before, limit)).await
+    }
+
+    async fn block(&self, height: u64) -> RpcResult<BlockResult> {
+        self.with_node(move |node| node.block(height)).await
+    }
+
+    async fn transactions(
+        &self,
+        before: Option<u64>,
+        limit: u32,
+        actor: Option<ActorId>,
+    ) -> RpcResult<TransactionsResult> {
+        self.with_node(move |node| node.transactions(before, limit, actor))
+            .await
+    }
+
+    async fn tx(&self, id: TxId) -> RpcResult<TransactionResult> {
+        self.with_node(move |node| node.transaction(id)).await
+    }
+
+    async fn actor_detail(&self, id: ActorId) -> RpcResult<ActorDetailResult> {
+        let snapshot = self.with_node(move |node| node.actor(&id.0)).await?;
+        tokio::task::spawn_blocking(move || crate::inspect::actor_detail(snapshot))
+            .await
+            .map_err(|error| internal(error.to_string()))
+    }
+
+    async fn contract_detail(&self, id: ContractId) -> RpcResult<ContractDetailResult> {
+        let (snapshot, status, tip, created_block, spent_block) = self
+            .with_node(move |node| {
+                let record = node
+                    .contract(&id.0)
+                    .ok_or_else(|| NodeError::UnknownContract(id.to_string()))?;
+                let snapshot = ContractResult {
+                    height: record.height,
+                    txid: TxId(record.txid.0),
+                    predicate: PredicatePoint(record.predicate),
+                    bytes: ContractEnvelope(record.contract.clone()),
+                };
+                let status = proof_result(node.proof(&id.0));
+                let created_block = node.block(snapshot.height)?.summary.id;
+                let spent_block = match &status {
+                    ProofResult::Spent { height, .. } => Some(node.block(*height)?.summary.id),
+                    _ => None,
+                };
+                let tip = node.tip();
+                Ok((
+                    snapshot,
+                    status,
+                    TipResult {
+                        hash: BlockId(tip.hash.into_bytes()),
+                        height: tip.height,
+                        contract_root: tip.contract_root,
+                    },
+                    created_block,
+                    spent_block,
+                ))
+            })
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            crate::inspect::contract_detail(id, snapshot, status, tip, created_block, spent_block)
+        })
+        .await
+        .map_err(|error| internal(error.to_string()))?
+        .map_err(|error| internal(error.to_string()))
+    }
+
     async fn tip(&self) -> RpcResult<TipResult> {
         self.with_node(|node| {
             let tip = node.tip();
@@ -126,6 +203,10 @@ impl FlamedApiServer for FlamedRpc {
     async fn submit_tx(&self, block_tx: BlockTxEnvelope) -> RpcResult<TxId> {
         self.with_node(move |node| Ok(TxId(node.submit(&block_tx.0)?.0)))
             .await
+    }
+
+    async fn actor(&self, id: ActorId) -> RpcResult<ActorResult> {
+        self.with_node(move |node| node.actor(&id.0)).await
     }
 
     async fn tx_status(&self, txid: TxId) -> RpcResult<TxStatusResult> {
@@ -189,7 +270,9 @@ pub async fn serve(
 impl From<NodeError> for ErrorObjectOwned {
     fn from(error: NodeError) -> Self {
         let code = match &error {
-            NodeError::UnknownContract(_) => codes::NOT_FOUND,
+            NodeError::UnknownContract(_) | NodeError::UnknownActor(_) | NodeError::NotFound(_) => {
+                codes::NOT_FOUND
+            }
             NodeError::Mempool(_) => codes::MEMPOOL_REJECTED,
             NodeError::Limit { .. } => codes::LIMIT_EXCEEDED,
             NodeError::Decode(_) => codes::INVALID_BYTES,

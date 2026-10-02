@@ -18,6 +18,8 @@ hex32_newtype! {
     TxId;
     /// A contract id.
     ContractId;
+    /// An actor address.
+    ActorId;
     /// A predicate's compressed point.
     PredicatePoint;
 }
@@ -31,6 +33,11 @@ base64_newtype! {
     BlockTxEnvelope;
     /// An output's note: the `Data` entry after it, byte for byte.
     NoteEnvelope;
+
+    /// An actor's raw VM bytecode.
+    ActorCode;
+    /// An actor's public `Value` state, encoded as a `CellEnvelope`.
+    ActorStateEnvelope;
 }
 
 /// The chain's current tip.
@@ -76,6 +83,36 @@ pub struct ContractResult {
     pub predicate: PredicatePoint,
     /// Its bytes, as published.
     pub bytes: ContractEnvelope,
+}
+
+/// An actor snapshot at the node's current tip; not a historical query or a proof.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorResult {
+    /// The requested actor address.
+    pub id: ActorId,
+    /// The height at which all fields were read.
+    pub height: u64,
+    /// The block hash at that height.
+    pub block: BlockId,
+    /// Code root cell hash, retained even if the body is unavailable.
+    #[serde(with = "crate::codec::hex32")]
+    pub code_hash: [u8; 32],
+    /// State root cell hash, retained even if the body is unavailable.
+    #[serde(with = "crate::codec::hex32")]
+    pub state_hash: [u8; 32],
+    /// Logical bytecode length, excluding cell framing.
+    pub code_size: u64,
+    /// Logical state size in encoded cell bytes.
+    pub state_size: u64,
+    /// Resident code/state bytes plus lease records.
+    pub storage_used: u64,
+    /// Capacity of leases valid at this height, in bytes.
+    pub storage_capacity: u64,
+    /// Base64 bytecode; null if not fully resident, for example after lease expiry.
+    pub code: Option<ActorCode>,
+    /// Base64 state envelope; null if its root body is unavailable. An envelope
+    /// can still contain pruned references, so decoding all values may fail.
+    pub state: Option<ActorStateEnvelope>,
 }
 
 /// Where a transaction is.
@@ -147,7 +184,7 @@ pub const MAX_PROOF_IDS: usize = 1024;
 
 /// Server-defined JSON-RPC error codes, in the -32000..-32099 range.
 pub mod codes {
-    /// The node has no such contract.
+    /// The node has no such contract or actor.
     pub const NOT_FOUND: i32 = -32001;
     /// The mempool refused a submitted transaction.
     pub const MEMPOOL_REJECTED: i32 = -32002;

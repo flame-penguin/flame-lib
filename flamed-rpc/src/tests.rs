@@ -3,8 +3,9 @@
 //! on.
 
 use crate::types::{
-    BlockId, ContractEnvelope, ContractId, NoteEnvelope, PredicatePoint, ProofBytes, ProofResult,
-    ScanEntry, ScanResult, SpentAt, TipResult, TxId, TxStatusResult,
+    ActorCode, ActorId, ActorResult, ActorStateEnvelope, BlockId, ContractEnvelope, ContractId,
+    NoteEnvelope, PredicatePoint, ProofBytes, ProofResult, ScanEntry, ScanResult, SpentAt,
+    TipResult, TxId, TxStatusResult,
 };
 
 #[test]
@@ -16,6 +17,41 @@ fn an_id_is_a_bare_hex_string() {
         serde_json::from_str::<BlockId>(&json).expect("deserialize"),
         id
     );
+}
+
+#[test]
+fn actor_snapshot_encodes_hashes_blobs_and_unavailable_bodies() {
+    let mut actor = ActorResult {
+        id: ActorId([0xab; 32]),
+        height: 7,
+        block: BlockId([0x11; 32]),
+        code_hash: [0x22; 32],
+        state_hash: [0x33; 32],
+        code_size: 3,
+        state_size: 70,
+        storage_used: 120,
+        storage_capacity: 1024,
+        code: Some(ActorCode(vec![1, 2, 3])),
+        state: Some(ActorStateEnvelope(vec![4, 5, 6])),
+    };
+    let json = serde_json::to_value(&actor).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "id": "ab".repeat(32), "height": 7, "block": "11".repeat(32),
+            "code_hash": "22".repeat(32), "state_hash": "33".repeat(32),
+            "code_size": 3, "state_size": 70, "storage_used": 120, "storage_capacity": 1024,
+            "code": "AQID", "state": "BAUG",
+        })
+    );
+    assert_eq!(serde_json::from_value::<ActorResult>(json).unwrap(), actor);
+    actor.code = None;
+    actor.state = None;
+    let json = serde_json::to_value(&actor).unwrap();
+    assert!(json["code"].is_null());
+    assert!(json["state"].is_null());
+    assert_eq!(serde_json::from_value::<ActorResult>(json).unwrap(), actor);
+    assert!(serde_json::from_str::<ActorId>("\"abcd\"").is_err());
 }
 
 #[test]

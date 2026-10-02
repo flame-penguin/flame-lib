@@ -7,11 +7,12 @@ pub mod storage;
 pub mod utreexo;
 
 pub use block::{
-    AppliedBlock, Block, BlockHeader, BlockLimits, BlockTx, Blockchain, ChainError, ChainParams,
-    ContractLeaf, ExecutionKind, ExecutionRecord, ReorgOutcome, StateCommitment,
+    ActorStateReader, AppliedBlock, Block, BlockHeader, BlockLimits, BlockTx, Blockchain,
+    ChainError, ChainParams, ContractLeaf, ExecutionEvent, ExecutionKind, ExecutionRecord,
+    ReorgOutcome, StateCommitment,
 };
 pub use mempool::{Mempool, MempoolEntry, MempoolError, MempoolPolicy, RebaseReport};
-pub use storage::{Lease, SPARKS_PER_FLAME, StorageError, StorageParams, StoredActor};
+pub use storage::{ActorInfo, Lease, SPARKS_PER_FLAME, StorageError, StorageParams, StoredActor};
 pub use utreexo::utreexo_hasher;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

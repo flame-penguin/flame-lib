@@ -1,8 +1,7 @@
 //! Every method, over real HTTP, through the generated client.
 //!
-//! The point of this round trip is the wire: the same seven calls a wallet
-//! will make, one error code for every method that has one, and a note that
-//! crosses HTTP inside a `scan` and still opens.
+//! Payment calls, errors, and encrypted notes over HTTP.
+//! Actor RPC coverage lives in `actors`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

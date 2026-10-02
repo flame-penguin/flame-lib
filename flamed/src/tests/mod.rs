@@ -1,10 +1,7 @@
-//! Fixtures shared by the two round trips.
-//!
-//! Every transaction here is built by `flamepayments` and nothing else, and
-//! every opening a test spends with comes from a note the node returned. No
-//! test assembles a script, so both round trips exercise the same client
-//! the wallet will be.
+//! Shared fixtures for payment and actor round trips.
 
+mod actors;
+mod explorer;
 mod node;
 mod rpc;
 

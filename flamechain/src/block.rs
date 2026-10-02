@@ -16,7 +16,9 @@ use merkle::{Hash, MerkleItem};
 use merlin::Transcript;
 
 use crate::BlockHash;
-use crate::storage::{ActorStore, RegistryUndo, StorageError, StorageParams, StoredActor};
+use crate::storage::{
+    ActorInfo, ActorStore, RegistryUndo, StorageError, StorageParams, StoredActor,
+};
 use crate::utreexo::{self, Catchup, Forest, Proof, UtreexoError};
 
 /// Consensus resource bounds. Networks can select smaller values through
@@ -532,6 +534,32 @@ pub struct ExecutionRecord {
     pub txid: TxID,
 }
 
+/// Read-only observations around one execution's committed effects.
+/// These events are local indexing hooks, not part of a block's encoding.
+pub enum ExecutionEvent<'a> {
+    /// The VM log is ready; the actor store still holds the state before its effects.
+    Before {
+        record: ExecutionRecord,
+        log: &'a TxLog,
+        error: Option<&'a str>,
+    },
+    /// All effects have been applied, including synchronous calls in this log.
+    After { record: ExecutionRecord },
+}
+
+/// Read-only public actor snapshots at the height being executed.
+pub struct ActorStateReader<'a> {
+    store: &'a ActorStore,
+    height: u64,
+}
+
+impl ActorStateReader<'_> {
+    /// Reads this execution boundary without executing or checking out the actor.
+    pub fn actor_info(&self, actor: &ActorID) -> Result<ActorInfo, VMError> {
+        self.store.actor_info(actor, self.height)
+    }
+}
+
 impl CellEncode for ExecutionRecord {
     fn encode(&self, builder: &mut CellBuilder) -> Result<(), CellError> {
         builder
@@ -668,6 +696,11 @@ impl Blockchain {
         self.header.state
     }
 
+    /// The current committed header, including genesis.
+    pub fn header(&self) -> &BlockHeader {
+        &self.header
+    }
+
     pub fn available_storage_bytes(&self) -> Result<u64, ChainError> {
         self.actors
             .available_units()
@@ -682,6 +715,11 @@ impl Blockchain {
     /// Snapshot content and exact body availability for archives/witness creation.
     pub fn actor_storage(&self, actor: &ActorID) -> Result<StoredActor, ChainError> {
         Ok(self.actors.stored_actor(actor)?)
+    }
+
+    /// Reads an actor at the current tip without executing or checking out its state.
+    pub fn actor_info(&self, actor: &ActorID) -> Result<ActorInfo, ChainError> {
+        Ok(self.actors.actor_info(actor, self.height())?)
     }
 
     pub fn actor_capacity(&self, actor: &ActorID, height: u64) -> Result<u64, ChainError> {
@@ -725,7 +763,7 @@ impl Blockchain {
         self.check_header(&block)?;
 
         self.actors.push_outer_checkpoint();
-        let transition = self.execute_body(&block);
+        let transition = self.execute_body(&block, &mut |_, _| Ok(()));
         self.actors.rollback_outer_checkpoint();
         let transition = transition?;
         block.header.state = transition.state;
@@ -735,12 +773,45 @@ impl Blockchain {
     }
 
     pub fn connect(&mut self, block: &Block) -> Result<AppliedBlock, ChainError> {
+        self.connect_with_observer(block, |_, _, _| Ok(()))
+    }
+
+    /// Connects a block while exposing borrowed logs for archival indexing.
+    /// Callbacks run in execution order before commitment validation completes.
+    /// Stage observations locally and publish only after this method returns Ok;
+    /// a later failure rolls back the chain, but cannot undo callback side effects.
+    /// An observer error also rejects and rolls back the transition.
+    pub fn connect_with_observer<F>(
+        &mut self,
+        block: &Block,
+        mut observe: F,
+    ) -> Result<AppliedBlock, ChainError>
+    where
+        F: FnMut(ExecutionRecord, &TxLog, Option<&str>) -> Result<(), ChainError>,
+    {
+        self.connect_with_state_observer(block, |event, _| match event {
+            ExecutionEvent::Before { record, log, error } => observe(record, log, error),
+            ExecutionEvent::After { .. } => Ok(()),
+        })
+    }
+
+    /// Observes the actor store immediately before and after each execution.
+    /// Both callbacks run before the block is fully validated: publish
+    /// observations only if this returns Ok.
+    pub fn connect_with_state_observer<F>(
+        &mut self,
+        block: &Block,
+        mut observe: F,
+    ) -> Result<AppliedBlock, ChainError>
+    where
+        F: FnMut(ExecutionEvent<'_>, ActorStateReader<'_>) -> Result<(), ChainError>,
+    {
         self.check_header(block)?;
         self.actors.push_outer_checkpoint();
         let old_header = self.header.clone();
         let old_contracts = self.contracts.clone();
 
-        let transition = match self.execute_body(block) {
+        let transition = match self.execute_body(block, &mut observe) {
             Ok(transition)
                 if transition.state == block.header.state
                     && transition.effects_root == block.header.effects_root =>
@@ -777,7 +848,10 @@ impl Blockchain {
         })
     }
 
-    fn execute_body(&mut self, block: &Block) -> Result<Transition, ChainError> {
+    fn execute_body<F>(&mut self, block: &Block, observe: &mut F) -> Result<Transition, ChainError>
+    where
+        F: FnMut(ExecutionEvent<'_>, ActorStateReader<'_>) -> Result<(), ChainError>,
+    {
         self.actors.begin_block(block.header.height)?;
         let mut work = self.contracts.work_forest();
         let hasher = utreexo::utreexo_hasher::<ContractLeaf>();
@@ -817,6 +891,21 @@ impl Blockchain {
                 return Err(ChainError::LimitExceeded);
             }
             let txid = log.txid();
+            let record = ExecutionRecord {
+                kind: ExecutionKind::External,
+                txid,
+            };
+            observe(
+                ExecutionEvent::Before {
+                    record,
+                    log: &log,
+                    error: None,
+                },
+                ActorStateReader {
+                    store: &self.actors,
+                    height: block.header.height,
+                },
+            )?;
             self.apply_log(
                 &mut work,
                 &hasher,
@@ -827,10 +916,14 @@ impl Blockchain {
                 &mut seen_outputs,
                 block.header.height,
             )?;
-            records.push(ExecutionRecord {
-                kind: ExecutionKind::External,
-                txid,
-            });
+            observe(
+                ExecutionEvent::After { record },
+                ActorStateReader {
+                    store: &self.actors,
+                    height: block.header.height,
+                },
+            )?;
+            records.push(record);
             // Finish this external transaction's complete FIFO message closure
             // before advancing; every descendant sees only this execution BoC.
             while let Some(message) = sends.pop_front() {
@@ -852,13 +945,32 @@ impl Blockchain {
                         ExecutionKind::Internal,
                         result.into_log(),
                         Some((self.actors.actor_root(), self.actors.available_units())),
+                        None,
                     )),
-                    Err(_) => Self::bounce_log(failed_message)
-                        .map(|log| (ExecutionKind::InternalFailed, log, None)),
+                    Err(error) => Self::bounce_log(failed_message).map(|log| {
+                        (
+                            ExecutionKind::InternalFailed,
+                            log,
+                            None,
+                            Some(error.to_string()),
+                        )
+                    }),
                 };
                 self.actors.pop_checkpoint_rollback();
-                let (kind, log, executed_actor_state) = staged?;
+                let (kind, log, executed_actor_state, error) = staged?;
                 let txid = log.txid();
+                let record = ExecutionRecord { kind, txid };
+                observe(
+                    ExecutionEvent::Before {
+                        record,
+                        log: &log,
+                        error: error.as_deref(),
+                    },
+                    ActorStateReader {
+                        store: &self.actors,
+                        height: block.header.height,
+                    },
+                )?;
                 self.apply_log(
                     &mut work,
                     &hasher,
@@ -875,7 +987,14 @@ impl Blockchain {
                         return Err(ChainError::CommitmentMismatch);
                     }
                 }
-                records.push(ExecutionRecord { kind, txid });
+                observe(
+                    ExecutionEvent::After { record },
+                    ActorStateReader {
+                        store: &self.actors,
+                        height: block.header.height,
+                    },
+                )?;
+                records.push(record);
             }
         }
 
@@ -1415,6 +1534,58 @@ mod tests {
             chain.build_block([4; 32], external_txs(3, constrained)),
             Err(ChainError::LimitExceeded)
         ));
+    }
+
+    #[test]
+    fn observer_failure_rolls_back_and_does_not_change_commitments() {
+        let mut chain = Blockchain::new(ChainParams::default()).unwrap();
+        let block = chain
+            .build_block([0x31; 32], external_txs(2, || ScriptBuilder::new().nop()))
+            .unwrap();
+        let before = (chain.tip(), chain.state_commitment());
+        let mut seen = 0;
+        let rejected = chain.connect_with_observer(&block, |record, log, error| {
+            seen += 1;
+            assert_eq!(record.kind, ExecutionKind::External);
+            assert_eq!(record.txid, log.txid());
+            assert!(error.is_none());
+            Err(ChainError::InvalidEffectLog)
+        });
+        assert!(matches!(rejected, Err(ChainError::InvalidEffectLog)));
+        assert_eq!(seen, 1);
+        assert_eq!((chain.tip(), chain.state_commitment()), before);
+        let mut boundaries = Vec::new();
+        let rejected = chain.connect_with_state_observer(&block, |event, _| {
+            match event {
+                ExecutionEvent::Before { record, .. } => boundaries.push((record.txid, false)),
+                ExecutionEvent::After { record } => {
+                    boundaries.push((record.txid, true));
+                    return Err(ChainError::InvalidEffectLog);
+                }
+            }
+            Ok(())
+        });
+        assert!(matches!(rejected, Err(ChainError::InvalidEffectLog)));
+        assert_eq!(
+            boundaries,
+            vec![
+                (block.transactions[0].tx.txid, false),
+                (block.transactions[0].tx.txid, true)
+            ]
+        );
+        assert_eq!((chain.tip(), chain.state_commitment()), before);
+        let mut observed = Vec::new();
+        let applied = chain
+            .connect_with_observer(&block, |record, _, _| {
+                observed.push(record);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(applied.records, observed);
+        assert_eq!(chain.state_commitment(), block.header.state);
+        let mut plain = Blockchain::new(ChainParams::default()).unwrap();
+        assert_eq!(plain.connect(&block).unwrap().id, applied.id);
+        assert_eq!(plain.state_commitment(), chain.state_commitment());
     }
 
     #[test]
